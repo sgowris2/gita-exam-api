@@ -41,6 +41,7 @@ def get_db():
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA foreign_keys=ON;")
 
     try:
         yield conn
@@ -65,28 +66,32 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS exams (
             id TEXT PRIMARY KEY,
             title TEXT,
-            active INTEGER
+            active INTEGER,
+            creator_id TEXT
         )""")
 
         c.execute("""CREATE TABLE IF NOT EXISTS questions (
-            id TEXT,
+            id TEXT PRIMARY KEY,
             exam_id TEXT,
             text TEXT,
-            lang TEXT
+            lang TEXT,
+            FOREIGN KEY (exam_id) REFERENCES exams(id) ON DELETE CASCADE
         )""")
 
         c.execute("""CREATE TABLE IF NOT EXISTS options (
-            id TEXT,
+            id TEXT PRIMARY KEY,
             question_id TEXT,
             text TEXT,
-            is_correct INTEGER
+            is_correct INTEGER,
+            FOREIGN KEY (question_id) REFERENCES questions(id) ON DELETE CASCADE
         )""")
 
         c.execute("""CREATE TABLE IF NOT EXISTS attempts (
             exam_id TEXT,
             candidate_id TEXT,
             submitted INTEGER,
-            PRIMARY KEY (exam_id, candidate_id)
+            PRIMARY KEY (exam_id, candidate_id),
+            FOREIGN KEY (exam_id) REFERENCES exams(id) ON DELETE CASCADE
         )""")
 
         # Prevent infinite growth
@@ -95,13 +100,16 @@ def init_db():
             candidate_id TEXT,
             question_id TEXT,
             option_id TEXT,
-            PRIMARY KEY (exam_id, candidate_id, question_id)
+            PRIMARY KEY (exam_id, candidate_id, question_id),
+            FOREIGN KEY (exam_id) REFERENCES exams(id) ON DELETE CASCADE,
+            FOREIGN KEY (question_id) REFERENCES questions(id) ON DELETE CASCADE,
+            FOREIGN KEY (option_id) REFERENCES options(id) ON DELETE CASCADE
         )""")
 
         row = c.execute("SELECT COUNT(*) as c FROM exams").fetchone()
         if row["c"] == 0:
             exam_id = "exam1"
-            c.execute("INSERT INTO exams VALUES (?, ?, ?)", (exam_id, "Sample Exam", 1))
+            c.execute("INSERT INTO exams VALUES (?, ?, ?, ?)", (exam_id, "Sample Exam", 1, "test_candidate"))
 
             q1 = "q1"
             q2 = "q2"
@@ -198,7 +206,7 @@ class CreateQuestionWithOptionsOut(BaseModel):
 def create_exam(req: CreateExamReq, candidate_id: str = Depends(get_candidate)):
     with get_db() as db:
         exam_id = str(uuid.uuid4())[:6]
-        db.execute("INSERT INTO exams VALUES (?, ?, 0)", (exam_id, req.title))
+        db.execute("INSERT INTO exams VALUES (?, ?, 0, ?)", (exam_id, req.title, candidate_id))
         return {"exam_id": exam_id}
 
 @app.post(
@@ -220,6 +228,9 @@ def add_question_with_options(
     req: CreateQuestionWithOptionsReq,
     candidate_id: str = Depends(get_candidate)
 ):
+    if exam_id == "exam1":
+        raise HTTPException(400, "Modifications to the sample exam are not allowed")
+
     if len(req.options) < 2:
         raise HTTPException(400, "A question must have at least 2 options")
 
@@ -264,6 +275,10 @@ def delete_question(
     candidate_id: str = Depends(get_candidate)
 ):
     with get_db() as db:
+        exam_id = db.execute("SELECT exam_id FROM questions WHERE id=?", (question_id,)).fetchone()
+        if exam_id == "exam1":
+            raise HTTPException(400, "Modifications to the sample exam are not allowed")
+
         q = db.execute("SELECT * FROM questions WHERE id=?", (question_id,)).fetchone()
         if not q:
             raise HTTPException(404, "Question not found")
@@ -287,6 +302,10 @@ def delete_question(
     tags=["Candidate"]
 )
 def activate_exam(exam_id: str, candidate_id: str = Depends(get_candidate)):
+
+    if exam_id == "exam1":
+        raise HTTPException(400, "Modifications to the sample exam are not allowed")
+
     with get_db() as db:
         db.execute("UPDATE exams SET active=0")
         db.execute("UPDATE exams SET active=1 WHERE id=?", (exam_id,))
@@ -352,6 +371,10 @@ def load_exam(exam_id: str, candidate_id: str = Depends(get_candidate)):
     tags=["Candidate"]
 )
 def select_option(exam_id: str, payload: SelectAnswerIn, candidate_id: str = Depends(get_candidate)):
+
+    if exam_id == "exam1":
+        raise HTTPException(400, "Modifications to the sample exam are not allowed")
+
     with get_db() as db:
         att = db.execute("SELECT * FROM attempts WHERE exam_id=? AND candidate_id=?", (exam_id, candidate_id)).fetchone()
         if att and att["submitted"]:
@@ -409,6 +432,10 @@ def get_state(exam_id: str, candidate_id: str = Depends(get_candidate)):
     tags=["Candidate"]
 )
 def submit_exam(exam_id: str, candidate_id: str = Depends(get_candidate)):
+
+    if exam_id == "exam1":
+        raise HTTPException(400, "Modifications to the sample exam are not allowed")
+
     with get_db() as db:
         db.execute("INSERT OR IGNORE INTO attempts VALUES (?, ?, 0)", (exam_id, candidate_id))
         db.execute("UPDATE attempts SET submitted=1 WHERE exam_id=? AND candidate_id=?", (exam_id, candidate_id))
@@ -436,5 +463,17 @@ def list_tokens():
 @app.delete("/admin/tokens/{token}", include_in_schema=False, dependencies=[Depends(require_admin)])
 def revoke_token(token: str):
     with get_db() as db:
-        db.execute("UPDATE tokens SET active=0 WHERE token=?", (token,))
+        rows = db.execute("UPDATE tokens SET active=0 WHERE token=?", (token,)).fetchall()
+        if db.total_changes == 0:
+            raise HTTPException(404, "Token not found")
     return {"status": "revoked"}
+
+@app.delete("/admin/candidates/{candidate_id}/data", include_in_schema=False, dependencies=[Depends(require_admin)])
+def delete_candidate_data(candidate_id: str):
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM tokens WHERE candidate_id=?", (candidate_id,)).fetchall()
+        if not rows:
+            raise HTTPException(404, "Candidate not found")
+        db.execute("DELETE FROM exams WHERE creator_id=?", (candidate_id,))
+        db.execute("DELETE FROM tokens WHERE candidate_id=?", (candidate_id,))
+    return {"status": "deleted"}
