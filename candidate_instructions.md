@@ -18,8 +18,9 @@ The system supports:
 
 You are given:
 - A base API URL
-- An API token
+- Two API tokens
 - API documentation via Swagger (`/docs`)
+- A sample exam with the exam_id `exam1` (you should not modify this exam; it is only a sample for you understand the system)
 
 ---
 

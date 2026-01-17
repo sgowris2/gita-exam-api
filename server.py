@@ -42,6 +42,7 @@ def get_db():
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
     conn.execute("PRAGMA foreign_keys=ON;")
+    conn.execute("PRAGMA max_page_count = 500000;")
 
     try:
         yield conn
@@ -192,124 +193,43 @@ class CreateQuestionWithOptionsOut(BaseModel):
 
 # ---------------- CANDIDATE APIS ----------------
 
-@app.post(
-    "/exam",
-    summary="Create a new exam",
-    description="""
-    Creates a new exam in DRAFT state.
-
-    The exam will not be visible to students until it is activated.
-    """,
-    response_model=CreateExamOut,
-    tags=["Candidate"]
-)
-def create_exam(req: CreateExamReq, candidate_id: str = Depends(get_candidate)):
+@app.get("/exam/all",
+        response_model=List[ExamOut],
+         summary="List all exams",
+         description="Lists all exams created in the system by the user.",
+         tags=["Candidate"]
+         )
+def list_exams(candidate_id: str = Depends(get_candidate)):
     with get_db() as db:
-        exam_id = str(uuid.uuid4())[:6]
-        db.execute("INSERT INTO exams VALUES (?, ?, 0, ?)", (exam_id, req.title, candidate_id))
-        return {"exam_id": exam_id}
+        rows = db.execute("SELECT * FROM exams WHERE creator_id=?", (candidate_id,)).fetchall()
+        return [dict(r) for r in rows]
 
-@app.post(
-    "/exam/{exam_id}/questions",
-    summary="Add a question (with options) to an exam",
+@app.get(
+    "/exam/{exam_id}/state",
+    response_model=StateOut,
+    summary="Get current exam state",
     description="""
-    Adds a new question to the given exam together with all its options in one atomic operation.
+    Returns the currently saved answers for this candidate and whether the exam is already submitted.
 
-    Rules:
-    - At least 2 options are required.
-    - At least 1 option must be marked as correct.
-    - If any insert fails, nothing is written.
-    """,
-    response_model=CreateQuestionWithOptionsOut,
-    tags=["Candidate"]
-)
-def add_question_with_options(
-    exam_id: str,
-    req: CreateQuestionWithOptionsReq,
-    candidate_id: str = Depends(get_candidate)
-):
-    if exam_id == "exam1":
-        raise HTTPException(400, "Modifications to the sample exam are not allowed")
-
-    if len(req.options) < 2:
-        raise HTTPException(400, "A question must have at least 2 options")
-
-    if not any(o.is_correct for o in req.options):
-        raise HTTPException(400, "At least one option must be marked as correct")
-
-    with get_db() as db:
-        exam = db.execute("SELECT * FROM exams WHERE id=?", (exam_id,)).fetchone()
-        if not exam:
-            raise HTTPException(404, "Exam not found")
-
-        qid = str(uuid.uuid4())
-        db.execute(
-            "INSERT INTO questions (id, exam_id, text, lang) VALUES (?, ?, ?, ?)",
-            (qid, exam_id, req.text, req.lang)
-        )
-
-        for opt in req.options:
-            oid = str(uuid.uuid4())
-            db.execute(
-                "INSERT INTO options (id, question_id, text, is_correct) VALUES (?, ?, ?, ?)",
-                (oid, qid, opt.text, int(opt.is_correct))
-            )
-
-    return {"question_id": qid}
-
-@app.delete(
-    "/questions/{question_id}",
-    summary="Delete a question",
-    description="""
-    Deletes a question and:
-
-    - All its options
-    - All answers given for this question
-
-    This operation is irreversible.
+    This is used when the device comes back online after connectivity loss.
     """,
     tags=["Candidate"]
 )
-def delete_question(
-    question_id: str,
-    candidate_id: str = Depends(get_candidate)
-):
+def get_state(exam_id: str, candidate_id: str = Depends(get_candidate)):
     with get_db() as db:
-        exam_id = db.execute("SELECT exam_id FROM questions WHERE id=?", (question_id,)).fetchone()
-        if exam_id == "exam1":
-            raise HTTPException(400, "Modifications to the sample exam are not allowed")
+        rows = db.execute(
+            "SELECT question_id, option_id FROM answers WHERE exam_id=? AND candidate_id=?",
+            (exam_id, candidate_id)
+        ).fetchall()
 
-        q = db.execute("SELECT * FROM questions WHERE id=?", (question_id,)).fetchone()
-        if not q:
-            raise HTTPException(404, "Question not found")
+        answers = {r["question_id"]: r["option_id"] for r in rows}
 
-        db.execute("DELETE FROM answers WHERE question_id=?", (question_id,))
-        db.execute("DELETE FROM options WHERE question_id=?", (question_id,))
-        db.execute("DELETE FROM questions WHERE id=?", (question_id,))
+        att = db.execute("SELECT * FROM attempts WHERE exam_id=? AND candidate_id=?", (exam_id, candidate_id)).fetchone()
 
-    return {"status": "deleted"}
-
-
-
-@app.post(
-    "/exam/{exam_id}/activate",
-    summary="Activate an exam",
-    description="""
-    Marks the given exam as active.
-
-    Only one exam should be active at a time in the system.
-    """,
-    tags=["Candidate"]
-)
-def activate_exam(exam_id: str, candidate_id: str = Depends(get_candidate)):
-
-    if exam_id == "exam1":
-        raise HTTPException(400, "Modifications to the sample exam are not allowed")
-
-    with get_db() as db:
-        db.execute("UPDATE exams SET active=0")
-        db.execute("UPDATE exams SET active=1 WHERE id=?", (exam_id,))
-    return {"status": "activated"}
+        return {
+            "answers": answers,
+            "submitted": bool(att["submitted"]) if att else False
+        }
 
 @app.get(
     "/exam/active",
@@ -358,6 +278,143 @@ def load_exam(exam_id: str, candidate_id: str = Depends(get_candidate)):
         return {"exam": dict(exam), "questions": questions}
 
 @app.post(
+    "/exam",
+    summary="Create a new exam",
+    description="""
+    Creates a new exam in DRAFT state.
+
+    The exam will not be visible to students until it is activated.
+    """,
+    response_model=CreateExamOut,
+    tags=["Candidate"]
+)
+def create_exam(req: CreateExamReq, candidate_id: str = Depends(get_candidate)):
+    with get_db() as db:
+        no_of_exams = db.execute("SELECT COUNT(*) as c FROM exams WHERE creator_id=?", (candidate_id,)).fetchone()["c"]
+        if no_of_exams >= 25:
+            raise HTTPException(400, "Exam creation limit reached (25)")
+        exam_id = str(uuid.uuid4())[:6]
+        db.execute("INSERT INTO exams VALUES (?, ?, 0, ?)", (exam_id, req.title, candidate_id))
+        return {"exam_id": exam_id}
+
+@app.post(
+    "/exam/{exam_id}/questions",
+    summary="Add a question (with options) to an exam",
+    description="""
+    Adds a new question to the given exam together with all its options in one atomic operation.
+
+    Rules:
+    - At least 2 options are required.
+    - At least 1 option must be marked as correct.
+    - If any insert fails, nothing is written.
+    """,
+    response_model=CreateQuestionWithOptionsOut,
+    tags=["Candidate"]
+)
+def add_question_with_options(
+    exam_id: str,
+    req: CreateQuestionWithOptionsReq,
+    candidate_id: str = Depends(get_candidate)
+):
+    if exam_id == "exam1":
+        raise HTTPException(400, "Modifications to the sample exam are not allowed")
+
+    if len(req.options) < 2:
+        raise HTTPException(400, "A question must have at least 2 options")
+
+    if len(req.options) > 6:
+        raise HTTPException(400, "A question can have at most 6 options")
+
+    if not any(o.is_correct for o in req.options):
+        raise HTTPException(400, "At least one option must be marked as correct")
+
+    with get_db() as db:
+
+        no_of_questions = db.execute("SELECT COUNT(*) as c FROM questions WHERE exam_id=?", (exam_id,)).fetchone()["c"]
+        if no_of_questions >= 25:
+            raise HTTPException(400, "Question limit reached for this exam (25)")
+
+        exam = db.execute("SELECT * FROM exams WHERE id=?", (exam_id,)).fetchone()
+        if not exam:
+            raise HTTPException(404, "Exam not found")
+
+        qid = str(uuid.uuid4())
+        db.execute(
+            "INSERT INTO questions (id, exam_id, text, lang) VALUES (?, ?, ?, ?)",
+            (qid, exam_id, req.text, req.lang)
+        )
+
+        for opt in req.options:
+            oid = str(uuid.uuid4())
+            db.execute(
+                "INSERT INTO options (id, question_id, text, is_correct) VALUES (?, ?, ?, ?)",
+                (oid, qid, opt.text, int(opt.is_correct))
+            )
+
+    return {"question_id": qid}
+
+@app.delete(
+    "/questions/{question_id}",
+    summary="Delete a question",
+    description="""
+    Deletes a question and:
+
+    - All its options
+    - All answers given for this question
+
+    This operation is irreversible.
+    """,
+    tags=["Candidate"]
+)
+def delete_question(
+    question_id: str,
+    candidate_id: str = Depends(get_candidate)
+):
+    with get_db() as db:
+        row = db.execute(
+            "SELECT exam_id FROM questions WHERE id=?",
+            (question_id,)
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(404, "Question not found")
+
+        if row["exam_id"] == "exam1":
+            raise HTTPException(400, "Modifications to the sample exam are not allowed")
+
+        q = db.execute("SELECT * FROM questions WHERE id=?", (question_id,)).fetchone()
+        if not q:
+            raise HTTPException(404, "Question not found")
+
+        db.execute("DELETE FROM answers WHERE question_id=?", (question_id,))
+        db.execute("DELETE FROM options WHERE question_id=?", (question_id,))
+        db.execute("DELETE FROM questions WHERE id=?", (question_id,))
+
+    return {"status": "deleted"}
+
+
+
+@app.post(
+    "/exam/{exam_id}/activate",
+    summary="Activate an exam",
+    description="""
+    Marks the given exam as active.
+
+    Only one exam should be active at a time in the system.
+    """,
+    tags=["Candidate"]
+)
+def activate_exam(exam_id: str, candidate_id: str = Depends(get_candidate)):
+
+    if exam_id == "exam1":
+        raise HTTPException(400, "Modifications to the sample exam are not allowed")
+
+    with get_db() as db:
+        db.execute("UPDATE exams SET active=0")
+        db.execute("UPDATE exams SET active=1 WHERE id=?", (exam_id,))
+    return {"status": "activated"}
+
+@app.post(
     "/exam/{exam_id}/select",
     summary="Save an answer selection",
     description="""
@@ -390,33 +447,6 @@ def select_option(exam_id: str, payload: SelectAnswerIn, candidate_id: str = Dep
         """, (exam_id, candidate_id, payload.question_id, payload.option_id))
 
     return {"status": "saved"}
-
-@app.get(
-    "/exam/{exam_id}/state",
-    response_model=StateOut,
-    summary="Get current exam state",
-    description="""
-    Returns the currently saved answers for this candidate and whether the exam is already submitted.
-
-    This is used when the device comes back online after connectivity loss.
-    """,
-    tags=["Candidate"]
-)
-def get_state(exam_id: str, candidate_id: str = Depends(get_candidate)):
-    with get_db() as db:
-        rows = db.execute(
-            "SELECT question_id, option_id FROM answers WHERE exam_id=? AND candidate_id=?",
-            (exam_id, candidate_id)
-        ).fetchall()
-
-        answers = {r["question_id"]: r["option_id"] for r in rows}
-
-        att = db.execute("SELECT * FROM attempts WHERE exam_id=? AND candidate_id=?", (exam_id, candidate_id)).fetchone()
-
-        return {
-            "answers": answers,
-            "submitted": bool(att["submitted"]) if att else False
-        }
 
 @app.post(
     "/exam/{exam_id}/submit",

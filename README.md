@@ -14,7 +14,7 @@ Candidates test the API using Swagger and a token. They never see the code.
 
 1. Start server
 
-2. Create candidate token
+2. Create 2 candidate API tokens
 ```bash
 curl -X POST '{host}/admin/tokens' \
   --header 'X-ADMIN-TOKEN: {your secret admin token here}' \
@@ -26,7 +26,7 @@ curl -X POST '{host}/admin/tokens' \
 
 3. Give candidate:
    - Base URL 
-   - Candidate token 
+   - 2 candidate tokens (API tokens from previous step)
    - /docs link
    
 4. After interview, revoke token
