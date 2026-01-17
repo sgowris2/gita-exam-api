@@ -1,5 +1,5 @@
 # Custom directories and files
-*.db
+*.db*
 config.yaml
 config.yml
 secrets.yml
