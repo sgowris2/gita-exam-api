@@ -169,6 +169,19 @@ class StateOut(BaseModel):
     answers: Dict[str, str]
     submitted: bool
 
+class CreateOptionIn(BaseModel):
+    text: SafeStr
+    is_correct: bool = False
+
+class CreateQuestionWithOptionsReq(BaseModel):
+    text: SafeStr
+    lang: SafeStr = "en"
+    options: List[CreateOptionIn]
+
+class CreateQuestionWithOptionsOut(BaseModel):
+    question_id: str
+
+
 # ---------------- CANDIDATE APIS ----------------
 
 @app.post(
@@ -184,9 +197,84 @@ class StateOut(BaseModel):
 )
 def create_exam(req: CreateExamReq, candidate_id: str = Depends(get_candidate)):
     with get_db() as db:
-        exam_id = str(uuid.uuid4())
+        exam_id = str(uuid.uuid4())[:6]
         db.execute("INSERT INTO exams VALUES (?, ?, 0)", (exam_id, req.title))
         return {"exam_id": exam_id}
+
+@app.post(
+    "/exam/{exam_id}/questions",
+    summary="Add a question (with options) to an exam",
+    description="""
+    Adds a new question to the given exam together with all its options in one atomic operation.
+
+    Rules:
+    - At least 2 options are required.
+    - At least 1 option must be marked as correct.
+    - If any insert fails, nothing is written.
+    """,
+    response_model=CreateQuestionWithOptionsOut,
+    tags=["Candidate"]
+)
+def add_question_with_options(
+    exam_id: str,
+    req: CreateQuestionWithOptionsReq,
+    candidate_id: str = Depends(get_candidate)
+):
+    if len(req.options) < 2:
+        raise HTTPException(400, "A question must have at least 2 options")
+
+    if not any(o.is_correct for o in req.options):
+        raise HTTPException(400, "At least one option must be marked as correct")
+
+    with get_db() as db:
+        exam = db.execute("SELECT * FROM exams WHERE id=?", (exam_id,)).fetchone()
+        if not exam:
+            raise HTTPException(404, "Exam not found")
+
+        qid = str(uuid.uuid4())
+        db.execute(
+            "INSERT INTO questions (id, exam_id, text, lang) VALUES (?, ?, ?, ?)",
+            (qid, exam_id, req.text, req.lang)
+        )
+
+        for opt in req.options:
+            oid = str(uuid.uuid4())
+            db.execute(
+                "INSERT INTO options (id, question_id, text, is_correct) VALUES (?, ?, ?, ?)",
+                (oid, qid, opt.text, int(opt.is_correct))
+            )
+
+    return {"question_id": qid}
+
+@app.delete(
+    "/questions/{question_id}",
+    summary="Delete a question",
+    description="""
+    Deletes a question and:
+
+    - All its options
+    - All answers given for this question
+
+    This operation is irreversible.
+    """,
+    tags=["Candidate"]
+)
+def delete_question(
+    question_id: str,
+    candidate_id: str = Depends(get_candidate)
+):
+    with get_db() as db:
+        q = db.execute("SELECT * FROM questions WHERE id=?", (question_id,)).fetchone()
+        if not q:
+            raise HTTPException(404, "Question not found")
+
+        db.execute("DELETE FROM answers WHERE question_id=?", (question_id,))
+        db.execute("DELETE FROM options WHERE question_id=?", (question_id,))
+        db.execute("DELETE FROM questions WHERE id=?", (question_id,))
+
+    return {"status": "deleted"}
+
+
 
 @app.post(
     "/exam/{exam_id}/activate",
